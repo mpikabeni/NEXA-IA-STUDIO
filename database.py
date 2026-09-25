@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -13,17 +14,17 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from config import DATABASE_URL, DAILY_FREE_CREDITS
 
 
-# ==========================================
+# ============================================================
 # BASE
-# ==========================================
+# ============================================================
 
 class Base(DeclarativeBase):
     pass
 
 
-# ==========================================
-# UTILISATEUR
-# ==========================================
+# ============================================================
+# UTILISATEURS
+# ============================================================
 
 class User(Base):
     __tablename__ = "users"
@@ -51,12 +52,21 @@ class User(Base):
         nullable=True,
     )
 
-    credits: Mapped[int] = mapped_column(
+    # Crédit gratuit disponible aujourd'hui
+    daily_credits: Mapped[int] = mapped_column(
         Integer,
         default=DAILY_FREE_CREDITS,
         nullable=False,
     )
 
+    # Crédits achetés avec Telegram Stars
+    purchased_credits: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+
+    # Date du dernier renouvellement
     last_credit_reset: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -76,9 +86,9 @@ class User(Base):
     )
 
 
-# ==========================================
+# ============================================================
 # HISTORIQUE DES GÉNÉRATIONS
-# ==========================================
+# ============================================================
 
 class Generation(Base):
     __tablename__ = "generations"
@@ -134,9 +144,9 @@ class Generation(Base):
     )
 
 
-# ==========================================
+# ============================================================
 # ACHATS TELEGRAM STARS
-# ==========================================
+# ============================================================
 
 class StarPurchase(Base):
     __tablename__ = "star_purchases"
@@ -176,9 +186,9 @@ class StarPurchase(Base):
     )
 
 
-# ==========================================
-# MOTEUR DATABASE
-# ==========================================
+# ============================================================
+# DATABASE
+# ============================================================
 
 connect_args = {}
 
@@ -187,10 +197,12 @@ if DATABASE_URL.startswith("sqlite"):
         "check_same_thread": False
     }
 
+
 engine = create_engine(
     DATABASE_URL,
     connect_args=connect_args,
 )
+
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -199,23 +211,24 @@ SessionLocal = sessionmaker(
 )
 
 
-# ==========================================
+# ============================================================
 # INITIALISATION
-# ==========================================
+# ============================================================
 
 def init_database():
     Base.metadata.create_all(engine)
 
 
-# ==========================================
+# ============================================================
 # UTILISATEUR
-# ==========================================
+# ============================================================
 
 def get_or_create_user(
     telegram_id: int,
     username: str | None = None,
     first_name: str | None = None,
 ):
+
     with SessionLocal() as session:
 
         user = session.scalar(
@@ -225,11 +238,13 @@ def get_or_create_user(
         )
 
         if user is None:
+
             user = User(
                 telegram_id=telegram_id,
                 username=username,
                 first_name=first_name,
-                credits=DAILY_FREE_CREDITS,
+                daily_credits=DAILY_FREE_CREDITS,
+                purchased_credits=0,
             )
 
             session.add(user)
@@ -237,6 +252,7 @@ def get_or_create_user(
             session.refresh(user)
 
         else:
+
             user.username = username
             user.first_name = first_name
 
@@ -246,11 +262,12 @@ def get_or_create_user(
         return user
 
 
-# ==========================================
+# ============================================================
 # RÉCUPÉRER UN UTILISATEUR
-# ==========================================
+# ============================================================
 
 def get_user(telegram_id: int):
+
     with SessionLocal() as session:
 
         return session.scalar(
@@ -260,14 +277,15 @@ def get_user(telegram_id: int):
         )
 
 
-# ==========================================
-# AJOUTER DES CRÉDITS
-# ==========================================
+# ============================================================
+# AJOUTER DES CRÉDITS ACHETÉS
+# ============================================================
 
-def add_credits(
+def add_purchased_credits(
     telegram_id: int,
     amount: int,
 ):
+
     if amount <= 0:
         raise ValueError(
             "Le nombre de crédits doit être positif."
@@ -286,25 +304,49 @@ def add_credits(
                 "Utilisateur introuvable."
             )
 
-        user.credits += amount
+        user.purchased_credits += amount
 
         session.commit()
 
-        return user.credits
+        return user.purchased_credits
 
 
-# ==========================================
+# ============================================================
+# CALCUL DU SOLDE TOTAL
+# ============================================================
+
+def get_total_credits(
+    telegram_id: int,
+):
+
+    with SessionLocal() as session:
+
+        user = session.scalar(
+            select(User).where(
+                User.telegram_id == telegram_id
+            )
+        )
+
+        if user is None:
+            return 0
+
+        return (
+            user.daily_credits
+            + user.purchased_credits
+        )
+
+
+# ============================================================
 # DÉDUIRE DES CRÉDITS
-# ==========================================
+# ============================================================
 
 def remove_credits(
     telegram_id: int,
     amount: int,
 ):
+
     if amount <= 0:
-        raise ValueError(
-            "Le nombre de crédits doit être positif."
-        )
+        return False
 
     with SessionLocal() as session:
 
@@ -317,19 +359,36 @@ def remove_credits(
         if user is None:
             return False
 
-        if user.credits < amount:
+        total = (
+            user.daily_credits
+            + user.purchased_credits
+        )
+
+        if total < amount:
             return False
 
-        user.credits -= amount
+        # On utilise d'abord les crédits gratuits.
+        from_daily = min(
+            user.daily_credits,
+            amount,
+        )
+
+        user.daily_credits -= from_daily
+
+        remaining = amount - from_daily
+
+        # Puis les crédits achetés.
+        if remaining > 0:
+            user.purchased_credits -= remaining
 
         session.commit()
 
         return True
 
 
-# ==========================================
-# ENREGISTRER UNE GÉNÉRATION
-# ==========================================
+# ============================================================
+# HISTORIQUE
+# ============================================================
 
 def save_generation(
     telegram_id: int,
@@ -340,6 +399,7 @@ def save_generation(
     result_url: str | None = None,
     status: str = "completed",
 ):
+
     with SessionLocal() as session:
 
         generation = Generation(
@@ -358,9 +418,9 @@ def save_generation(
         return generation.id
 
 
-# ==========================================
-# ENREGISTRER UN PAIEMENT
-# ==========================================
+# ============================================================
+# PAIEMENT STARS
+# ============================================================
 
 def save_star_purchase(
     telegram_id: int,
@@ -368,6 +428,7 @@ def save_star_purchase(
     stars: int,
     credits_added: int,
 ):
+
     with SessionLocal() as session:
 
         existing = session.scalar(
@@ -377,8 +438,7 @@ def save_star_purchase(
             )
         )
 
-        # Empêche de créditer deux fois
-        # le même paiement Telegram.
+        # Empêche un double crédit du même paiement.
         if existing is not None:
             return False
 
@@ -390,15 +450,31 @@ def save_star_purchase(
         )
 
         session.add(purchase)
+
+        user = session.scalar(
+            select(User).where(
+                User.telegram_id == telegram_id
+            )
+        )
+
+        if user is None:
+            return False
+
+        user.purchased_credits += credits_added
+
         session.commit()
 
         return True
 
 
-# ==========================================
-# TEST LOCAL
-# ==========================================
+# ============================================================
+# TEST
+# ============================================================
 
 if __name__ == "__main__":
+
     init_database()
-    print("Base de données NEXA AI STUDIO initialisée.")
+
+    print(
+        "✅ Base de données NEXA AI STUDIO initialisée."
+    )
