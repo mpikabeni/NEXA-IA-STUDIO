@@ -4,10 +4,11 @@ from config import (
     DAILY_FREE_CREDITS,
     CREDIT_PACK_AMOUNT,
 )
+
 from database import (
     SessionLocal,
     User,
-    add_credits,
+    get_total_credits,
     remove_credits,
 )
 
@@ -16,49 +17,14 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def refresh_daily_credits(user: User) -> int:
+def refresh_daily_credits(telegram_id: int) -> int:
     """
-    Vérifie si le quota quotidien doit être renouvelé.
+    Renouvelle uniquement les crédits gratuits.
 
-    Important :
-    les crédits achetés ne sont pas séparés dans cette première
-    version. Le système remet le solde à 100 chaque nouveau jour.
+    Les crédits achetés sont conservés.
     """
 
     now = utc_now()
-
-    last_reset = user.last_credit_reset
-
-    if last_reset is None:
-        needs_reset = True
-    else:
-        needs_reset = (
-            last_reset.date() != now.date()
-        )
-
-    if not needs_reset:
-        return user.credits
-
-    with SessionLocal() as session:
-
-        db_user = session.get(User, user.id)
-
-        if db_user is None:
-            return 0
-
-        db_user.credits = DAILY_FREE_CREDITS
-        db_user.last_credit_reset = now
-
-        session.commit()
-
-        return db_user.credits
-
-
-def get_balance(telegram_id: int) -> int:
-    """
-    Retourne le solde actuel après vérification
-    du renouvellement quotidien.
-    """
 
     with SessionLocal() as session:
 
@@ -73,19 +39,35 @@ def get_balance(telegram_id: int) -> int:
         if user is None:
             return 0
 
-        now = utc_now()
+        last_reset = user.last_credit_reset
 
+        # Nouveau jour
         if (
-            user.last_credit_reset is None
-            or user.last_credit_reset.date()
-            != now.date()
+            last_reset is None
+            or last_reset.date() != now.date()
         ):
-            user.credits = DAILY_FREE_CREDITS
+
+            user.daily_credits = DAILY_FREE_CREDITS
             user.last_credit_reset = now
 
             session.commit()
 
-        return user.credits
+        return (
+            user.daily_credits
+            + user.purchased_credits
+        )
+
+
+def get_balance(telegram_id: int) -> int:
+    """
+    Retourne le nombre total de crédits disponibles.
+    """
+
+    refresh_daily_credits(telegram_id)
+
+    return get_total_credits(
+        telegram_id
+    )
 
 
 def has_enough_credits(
@@ -96,7 +78,9 @@ def has_enough_credits(
     if required <= 0:
         return True
 
-    balance = get_balance(telegram_id)
+    balance = get_balance(
+        telegram_id
+    )
 
     return balance >= required
 
@@ -105,12 +89,18 @@ def spend_credits(
     telegram_id: int,
     amount: int,
 ) -> bool:
+    """
+    Déduit les crédits gratuits en premier,
+    puis les crédits achetés.
+    """
 
     if amount <= 0:
         return False
 
-    # Vérifie d'abord le renouvellement.
-    get_balance(telegram_id)
+    # Vérifie d'abord le nouveau jour.
+    refresh_daily_credits(
+        telegram_id
+    )
 
     return remove_credits(
         telegram_id,
@@ -118,34 +108,63 @@ def spend_credits(
     )
 
 
-def purchase_credit_pack(
+def get_credit_details(
     telegram_id: int,
-) -> int:
-
+):
     """
-    Ajoute le pack acheté.
-
-    Cette fonction doit être appelée UNIQUEMENT
-    après confirmation du paiement Telegram Stars.
+    Retourne le détail du portefeuille.
     """
 
-    return add_credits(
-        telegram_id,
-        CREDIT_PACK_AMOUNT,
+    refresh_daily_credits(
+        telegram_id
     )
+
+    with SessionLocal() as session:
+
+        user = (
+            session.query(User)
+            .filter(
+                User.telegram_id == telegram_id
+            )
+            .first()
+        )
+
+        if user is None:
+            return {
+                "daily": 0,
+                "purchased": 0,
+                "total": 0,
+            }
+
+        return {
+            "daily": user.daily_credits,
+            "purchased": user.purchased_credits,
+            "total": (
+                user.daily_credits
+                + user.purchased_credits
+            ),
+        }
 
 
 def credits_message(
     telegram_id: int,
 ) -> str:
 
-    balance = get_balance(telegram_id)
+    data = get_credit_details(
+        telegram_id
+    )
 
     return (
         "💎 <b>NEXA AI STUDIO</b>\n\n"
-        f"Crédits disponibles : <b>{balance}</b>\n\n"
-        f"🎁 Quota quotidien : "
-        f"<b>{DAILY_FREE_CREDITS}</b>\n"
-        f"⭐ Pack supplémentaire : "
-        f"<b>{CREDIT_PACK_AMOUNT} crédits</b>"
+        f"🎁 Crédits gratuits : "
+        f"<b>{data['daily']}</b>\n"
+        f"⭐ Crédits achetés : "
+        f"<b>{data['purchased']}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"💎 Total : <b>{data['total']}</b>\n\n"
+        f"🎁 Renouvellement : "
+        f"<b>{DAILY_FREE_CREDITS}</b> crédits/jour\n"
+        f"⭐ Pack : "
+        f"<b>{CREDIT_PACK_AMOUNT} crédits</b> "
+        f"pour <b>10 ⭐</b>"
     )
